@@ -81,3 +81,27 @@ type ModelInfo struct {
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
+
+// --- Streaming (SSE) models ---
+
+// ChatCompletionChunk represents a single SSE chunk in streaming mode
+type ChatCompletionChunk struct {
+	ID      string        `json:"id"`
+	Object  string        `json:"object"`
+	Created int64         `json:"created"`
+	Model   string        `json:"model"`
+	Choices []ChunkChoice `json:"choices"`
+}
+
+// ChunkChoice represents a choice in a streaming chunk
+type ChunkChoice struct {
+	Index        int          `json:"index"`
+	Delta        ChunkDelta   `json:"delta"`
+	FinishReason *string      `json:"finish_reason"`
+}
+
+// ChunkDelta represents the delta content in a streaming chunk
+type ChunkDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}

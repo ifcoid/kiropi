@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -63,8 +65,19 @@ func (h *Handler) ChatCompletion(c *gin.Context) {
 		return
 	}
 
+	// Route to streaming or non-streaming handler
+	if req.Stream {
+		h.chatCompletionStream(c, &req)
+		return
+	}
+
+	h.chatCompletionNonStream(c, &req)
+}
+
+// chatCompletionNonStream handles non-streaming chat completions
+func (h *Handler) chatCompletionNonStream(c *gin.Context, req *models.ChatCompletionRequest) {
 	// Process through MCP bridge
-	response, err := h.bridge.ProcessChat(c.Request.Context(), &req)
+	response, err := h.bridge.ProcessChat(c.Request.Context(), req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error: models.ErrorDetail{
@@ -104,6 +117,140 @@ func (h *Handler) ChatCompletion(c *gin.Context) {
 			TotalTokens:      estimateTokens(req.Messages) + estimateTokens([]models.ChatMessage{{Content: response}}),
 		},
 	})
+}
+
+// chatCompletionStream handles SSE streaming chat completions
+func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletionRequest) {
+	completionID := "chatcmpl-" + uuid.New().String()[:8]
+	modelName := req.Model
+	if modelName == "" {
+		modelName = h.cfg.DefaultModel
+	}
+	created := time.Now().Unix()
+
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Transfer-Encoding", "chunked")
+	c.Header("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Get the http.Flusher
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Error: models.ErrorDetail{
+				Message: "Streaming not supported",
+				Type:    "server_error",
+				Code:    "no_flusher",
+			},
+		})
+		return
+	}
+
+	// Send initial chunk with role
+	initialChunk := models.ChatCompletionChunk{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   modelName,
+		Choices: []models.ChunkChoice{
+			{
+				Index: 0,
+				Delta: models.ChunkDelta{
+					Role: "assistant",
+				},
+				FinishReason: nil,
+			},
+		},
+	}
+	h.writeSSEChunk(c, flusher, &initialChunk)
+
+	// Process through MCP bridge with streaming
+	chunks := make(chan string, 100)
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(chunks)
+		errChan <- h.bridge.ProcessChatStream(c.Request.Context(), req, chunks)
+	}()
+
+	// Stream chunks to client
+	for chunk := range chunks {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		default:
+			chunkData := models.ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   modelName,
+				Choices: []models.ChunkChoice{
+					{
+						Index: 0,
+						Delta: models.ChunkDelta{
+							Content: chunk,
+						},
+						FinishReason: nil,
+					},
+				},
+			}
+			h.writeSSEChunk(c, flusher, &chunkData)
+		}
+	}
+
+	// Check for errors
+	if err := <-errChan; err != nil {
+		// Send error as a chunk (best effort, client may have disconnected)
+		errChunk := models.ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   modelName,
+			Choices: []models.ChunkChoice{
+				{
+					Index: 0,
+					Delta: models.ChunkDelta{
+						Content: fmt.Sprintf("\n\n[Error: %s]", err.Error()),
+					},
+					FinishReason: nil,
+				},
+			},
+		}
+		h.writeSSEChunk(c, flusher, &errChunk)
+	}
+
+	// Send final chunk with finish_reason
+	stopReason := "stop"
+	finalChunk := models.ChatCompletionChunk{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   modelName,
+		Choices: []models.ChunkChoice{
+			{
+				Index:        0,
+				Delta:        models.ChunkDelta{},
+				FinishReason: &stopReason,
+			},
+		},
+	}
+	h.writeSSEChunk(c, flusher, &finalChunk)
+
+	// Send [DONE] marker
+	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// writeSSEChunk writes a single SSE event to the response
+func (h *Handler) writeSSEChunk(c *gin.Context, flusher http.Flusher, chunk *models.ChatCompletionChunk) {
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+	flusher.Flush()
 }
 
 // ListModels handles GET /v1/models (OpenAI-compatible)

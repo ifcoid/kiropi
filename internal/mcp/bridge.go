@@ -141,6 +141,62 @@ func (b *Bridge) ProcessChat(ctx context.Context, req *models.ChatCompletionRequ
 	return response, nil
 }
 
+// ProcessChatStream processes a chat request and sends chunks to the provided channel.
+// Each string sent to the channel represents a text chunk to be streamed.
+// The channel is closed when processing is complete.
+func (b *Bridge) ProcessChatStream(ctx context.Context, req *models.ChatCompletionRequest, chunks chan<- string) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.ready {
+		return fmt.Errorf("MCP bridge not connected")
+	}
+
+	prompt := extractLastUserMessage(req.Messages)
+	if prompt == "" {
+		return fmt.Errorf("no user message found in request")
+	}
+
+	conversationContext := buildConversationContext(req.Messages)
+
+	// Get the full response from MCP
+	response, err := b.callMCPTool(ctx, "ask", map[string]interface{}{
+		"prompt":  prompt,
+		"context": conversationContext,
+		"stream":  true,
+	})
+	if err != nil {
+		response, err = b.callMCPTool(ctx, "chat", map[string]interface{}{
+			"messages": req.Messages,
+			"stream":   true,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to process through MCP: %w", err)
+		}
+	}
+
+	// Simulate streaming by splitting response into chunks
+	// MCP doesn't natively support streaming from tool calls,
+	// so we chunk the response to provide SSE experience
+	chunkSize := 20 // characters per chunk (tunable)
+	runes := []rune(response)
+
+	for i := 0; i < len(runes); i += chunkSize {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			end := i + chunkSize
+			if end > len(runes) {
+				end = len(runes)
+			}
+			chunks <- string(runes[i:end])
+		}
+	}
+
+	return nil
+}
+
 // callMCPTool calls a specific tool on the MCP server
 func (b *Bridge) callMCPTool(ctx context.Context, toolName string, args map[string]interface{}) (string, error) {
 	callReq := mcp.CallToolRequest{}
