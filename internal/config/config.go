@@ -35,7 +35,7 @@ func Load() *Config {
 	maxConcurrent, _ := strconv.Atoi(getEnv("KIROPI_MAX_CONCURRENT", "10"))
 
 	return &Config{
-		ServerPort:       getEnv("KIROPI_PORT", "8080"),
+		ServerPort:       getEnv("KIROPI_PORT", "50403"),
 		MCPServerCommand: getEnv("KIROPI_MCP_COMMAND", ""),
 		MCPServerArgs:    parseArgs(getEnv("KIROPI_MCP_ARGS", "")),
 		MCPTransport:     getEnv("KIROPI_MCP_TRANSPORT", "stdio"),

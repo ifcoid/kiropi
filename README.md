@@ -70,7 +70,7 @@ All configuration is done via environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `KIROPI_PORT` | REST API server port | `8080` |
+| `KIROPI_PORT` | REST API server port | `50403` |
 | `KIROPI_MCP_COMMAND` | Command to start MCP server | (required) |
 | `KIROPI_MCP_ARGS` | Arguments for MCP server command | |
 | `KIROPI_MCP_TRANSPORT` | Transport type: `stdio` or `sse` | `stdio` |
@@ -86,7 +86,7 @@ All configuration is done via environment variables:
 OpenAI-compatible chat completion endpoint.
 
 ```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
+curl -X POST http://localhost:50403/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key" \
   -d '{
@@ -177,7 +177,7 @@ Kiropi connects to an MCP server via stdio. Your MCP server needs to expose tool
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
+    base_url="http://localhost:50403/v1",
     api_key="your-api-key"
 )
 
@@ -197,7 +197,7 @@ print(response.choices[0].message.content)
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
+    base_url="http://localhost:50403/v1",
     api_key="your-api-key"
 )
 
@@ -216,7 +216,7 @@ print()
 ### JavaScript/TypeScript
 
 ```typescript
-const response = await fetch('http://localhost:8080/v1/chat/completions', {
+const response = await fetch('http://localhost:50403/v1/chat/completions', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
@@ -235,7 +235,7 @@ console.log(data.choices[0].message.content);
 ### cURL (streaming)
 
 ```bash
-curl -N -X POST http://localhost:8080/v1/chat/completions \
+curl -N -X POST http://localhost:50403/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key" \
   -d '{
@@ -270,7 +270,7 @@ export KIROPI_API_KEY=mysecretkey
 ./kiropi
 
 # Terminal 2: Expose via Cloudflare
-cloudflared tunnel --url http://localhost:8080
+cloudflared tunnel --url http://localhost:50403
 ```
 
 Output:
@@ -308,7 +308,7 @@ credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
   - hostname: kiropi.yourdomain.com
-    service: http://localhost:8080
+    service: http://localhost:50403
   - service: http_status:404
 EOF
 

@@ -12,7 +12,7 @@
 
 set -e
 
-KIROPI_PORT="${KIROPI_PORT:-8080}"
+KIROPI_PORT="${KIROPI_PORT:-50403}"
 TUNNEL_NAME="${TUNNEL_NAME:-kiropi}"
 
 # Colors
