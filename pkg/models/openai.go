@@ -4,12 +4,12 @@ package models
 
 // ChatCompletionRequest represents an OpenAI-compatible chat completion request
 type ChatCompletionRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ChatMessage   `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []Tool          `json:"tools,omitempty"`
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Temperature float64       `json:"temperature,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
+	Tools       []Tool        `json:"tools,omitempty"`
 }
 
 // ChatMessage represents a single message in the conversation
@@ -95,9 +95,9 @@ type ChatCompletionChunk struct {
 
 // ChunkChoice represents a choice in a streaming chunk
 type ChunkChoice struct {
-	Index        int          `json:"index"`
-	Delta        ChunkDelta   `json:"delta"`
-	FinishReason *string      `json:"finish_reason"`
+	Index        int        `json:"index"`
+	Delta        ChunkDelta `json:"delta"`
+	FinishReason *string    `json:"finish_reason"`
 }
 
 // ChunkDelta represents the delta content in a streaming chunk

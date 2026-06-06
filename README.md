@@ -1,51 +1,69 @@
 # Kiropi
 
-**MCP Bridge + OpenAI-Compatible REST API**
+**MCP Server + OpenAI-Compatible REST API Bridge**
 
-Kiropi is a Golang server that acts as a bridge between any application and an MCP (Model Context Protocol) server like Kiro. It exposes an OpenAI-compatible REST API, so any app that speaks OpenAI format can communicate with your MCP server transparently.
+Kiropi adalah server Golang yang menjembatani aplikasi (NSA) dengan Kiro AI. Aplikasi mengirim prompt via REST API format OpenAI, Kiro mengambil dan menjawab prompt tersebut via MCP protocol.
 
 ## Architecture
 
 ```
-┌─────────────┐       MCP Protocol        ┌──────────────────────┐       REST API        ┌─────────────────┐
-│    Kiro      │ ◄────────────────────────► │      Kiropi          │ ◄───────────────────► │  Your App       │
-│  (MCP Server)│    (stdio/SSE)             │  (Bridge + REST)     │    (OpenAI format)    │  (Mobile/Web)   │
-└─────────────┘                            └──────────────────────┘                       └─────────────────┘
+┌───────┐  POST /v1/chat/completions  ┌──────────────────────┐  MCP SSE (tools)  ┌────────┐
+│  NSA  │ ──────────────────────────► │       Kiropi         │ ◄────────────────── │  Kiro  │
+│ (App) │ ◄────────────────────────── │  REST API + MCP Srv  │ ──────────────────► │  (AI)  │
+└───────┘     OpenAI JSON response     └──────────────────────┘   tool results      └────────┘
+                                              :50403                   :50404
 ```
+
+### Flow
+
+1. **NSA** sends `POST /v1/chat/completions` to Kiropi (port 50403)
+2. **Kiropi** queues the prompt and waits
+3. **Kiro** (connected via MCP SSE on port 50404) calls `get_pending_prompt` tool
+4. **Kiro** processes the prompt with its AI capabilities
+5. **Kiro** calls `submit_response` tool with the answer
+6. **Kiropi** receives the response, packages it as OpenAI JSON, returns to NSA
 
 ## Features
 
 - OpenAI-compatible REST API (`/v1/chat/completions`)
-- **SSE Streaming** support (`"stream": true`)
-- MCP client that connects to any MCP server via stdio or SSE
+- SSE Streaming support (`"stream": true`)
+- MCP Server (SSE transport) for Kiro to connect
+- Thread-safe prompt queue with configurable timeout
 - Bearer token authentication (optional)
 - CORS support
-- Graceful shutdown
-- Health check endpoint
 - Cloudflare Tunnel ready (expose to internet without public IP)
-- Single binary, runs anywhere (Linux, macOS, Windows)
+- Single binary, cross-platform (Linux, macOS, Windows)
 
 ## Quick Start
 
 ### Prerequisites
 
 - Go 1.22+
-- An MCP server to connect to
 
-### Run locally
+### Build & Run
 
 ```bash
-# Clone
 git clone https://github.com/ifcoid/kiropi.git
 cd kiropi
 
-# Configure
-cp .env.example .env
-# Edit .env with your MCP server settings
-
-# Build and run
+# Build
 go build -o kiropi ./cmd/server
+
+# Run
 ./kiropi
+```
+
+Output:
+```
+[MCP] Starting MCP SSE Server on port 50404
+[MCP] Kiro connects to: http://localhost:50404/sse
+[MCP] Tools available: get_pending_prompt, submit_response, queue_status
+[API] Starting REST server on port 50403
+[API] Endpoints:
+[API]   POST /v1/chat/completions  - OpenAI-compatible chat
+[API]   POST /api/ask              - Alias for chat completions
+[API]   GET  /v1/models            - List available models
+[API]   GET  /health               - Health check
 ```
 
 ### Cross-compile
@@ -66,24 +84,111 @@ GOOS=windows GOARCH=amd64 go build -o kiropi.exe ./cmd/server
 
 ## Configuration
 
-All configuration is done via environment variables:
+All configuration via environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `KIROPI_PORT` | REST API server port | `50403` |
-| `KIROPI_MCP_COMMAND` | Command to start MCP server | (required) |
-| `KIROPI_MCP_ARGS` | Arguments for MCP server command | |
-| `KIROPI_MCP_TRANSPORT` | Transport type: `stdio` or `sse` | `stdio` |
-| `KIROPI_MCP_SSE_URL` | SSE URL (if using SSE transport) | |
-| `KIROPI_API_KEY` | API key for authentication | (disabled) |
-| `KIROPI_MODEL` | Default model name in responses | `kiropi-1` |
+| `KIROPI_PORT` | REST API port (for NSA/apps) | `50403` |
+| `KIROPI_MCP_PORT` | MCP SSE port (for Kiro) | `50404` |
+| `KIROPI_API_KEY` | API key for REST auth | (disabled) |
+| `KIROPI_MODEL` | Default model name | `kiropi-1` |
 | `KIROPI_MAX_CONCURRENT` | Max concurrent requests | `10` |
+| `KIROPI_PROMPT_TIMEOUT` | Seconds to wait for Kiro | `120` |
 
-## API Endpoints
+## MCP Tools (for Kiro)
+
+Kiro connects to Kiropi as an MCP client and uses these tools:
+
+### `get_pending_prompt`
+
+Picks up the next prompt from the queue.
+
+**Input:** none
+
+**Output:**
+```json
+{
+  "status": "pending",
+  "prompt_id": "uuid-here",
+  "model": "kiropi-1",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Explain microservices"}
+  ]
+}
+```
+
+Or if empty:
+```json
+{"status": "empty", "message": "No pending prompts in queue"}
+```
+
+### `submit_response`
+
+Submits Kiro's answer for a prompt.
+
+**Input:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt_id` | string | yes | The ID from `get_pending_prompt` |
+| `response` | string | yes | The AI response text |
+
+**Output:**
+```json
+{"status": "submitted", "prompt_id": "uuid-here"}
+```
+
+### `queue_status`
+
+Check queue status.
+
+**Output:**
+```json
+{"pending": 3, "total": 5}
+```
+
+## How Kiro Connects
+
+Kiro connects to Kiropi's MCP SSE endpoint. The typical flow:
+
+```
+Kiro (MCP Client) ──── SSE ────► Kiropi (MCP Server :50404)
+                                       │
+                                       ├─ tool: get_pending_prompt → returns prompt
+                                       ├─ (Kiro thinks...)
+                                       └─ tool: submit_response(prompt_id, response)
+```
+
+### Kiro MCP Config
+
+Add Kiropi as an MCP server in Kiro's configuration:
+
+```json
+{
+  "mcpServers": {
+    "kiropi": {
+      "url": "http://localhost:50404/sse"
+    }
+  }
+}
+```
+
+Or via Cloudflare Tunnel:
+```json
+{
+  "mcpServers": {
+    "kiropi": {
+      "url": "https://kiropi.yourdomain.com/sse"
+    }
+  }
+}
+```
+
+## REST API Endpoints (for NSA/Apps)
 
 ### POST `/v1/chat/completions`
 
-OpenAI-compatible chat completion endpoint.
+OpenAI-compatible chat completion. Blocks until Kiro responds or timeout.
 
 ```bash
 curl -X POST http://localhost:50403/v1/chat/completions \
@@ -92,17 +197,15 @@ curl -X POST http://localhost:50403/v1/chat/completions \
   -d '{
     "model": "kiropi-1",
     "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Hello, how are you?"}
+      {"role": "user", "content": "Hello, explain Docker in 3 sentences"}
     ]
   }'
 ```
 
 **Response:**
-
 ```json
 {
-  "id": "chatcmpl-abc123",
+  "id": "chatcmpl-abc12345",
   "object": "chat.completion",
   "created": 1717689600,
   "model": "kiropi-1",
@@ -111,67 +214,53 @@ curl -X POST http://localhost:50403/v1/chat/completions \
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "Hello! I'm doing well. How can I help you today?"
+        "content": "Docker is a containerization platform..."
       },
       "finish_reason": "stop"
     }
   ],
   "usage": {
-    "prompt_tokens": 20,
-    "completion_tokens": 12,
-    "total_tokens": 32
+    "prompt_tokens": 10,
+    "completion_tokens": 25,
+    "total_tokens": 35
   }
 }
 ```
 
+### POST `/v1/chat/completions` (streaming)
+
+```bash
+curl -N -X POST http://localhost:50403/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kiropi-1",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
 ### POST `/api/ask`
 
-Alias for `/v1/chat/completions` (same request/response format).
+Alias for `/v1/chat/completions`.
 
 ### GET `/v1/models`
 
 List available models.
 
-### GET `/v1/tools`
-
-List available MCP tools from the connected server.
-
 ### GET `/health`
-
-Health check (no auth required).
 
 ```json
 {
   "status": "ok",
-  "mcp_bridge": "connected",
-  "timestamp": "2024-01-01T00:00:00Z"
+  "queue_pending": 0,
+  "queue_total": 0,
+  "timestamp": "2025-01-01T00:00:00Z"
 }
 ```
 
-## MCP Server Setup
+## Client Examples
 
-Kiropi connects to an MCP server via stdio. Your MCP server needs to expose tools that Kiropi can call. At minimum, define an `ask` or `chat` tool:
-
-**Example MCP tool (the server Kiropi connects to should expose):**
-
-```json
-{
-  "name": "ask",
-  "description": "Ask a question and get a response",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "prompt": { "type": "string" },
-      "context": { "type": "string" }
-    },
-    "required": ["prompt"]
-  }
-}
-```
-
-## Integration Examples
-
-### Python (using openai library)
+### Python (OpenAI SDK)
 
 ```python
 from openai import OpenAI
@@ -183,9 +272,7 @@ client = OpenAI(
 
 response = client.chat.completions.create(
     model="kiropi-1",
-    messages=[
-        {"role": "user", "content": "Explain microservices architecture"}
-    ]
+    messages=[{"role": "user", "content": "Hello Kiro!"}]
 )
 
 print(response.choices[0].message.content)
@@ -194,23 +281,15 @@ print(response.choices[0].message.content)
 ### Python (streaming)
 
 ```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:50403/v1",
-    api_key="your-api-key"
-)
-
 stream = client.chat.completions.create(
     model="kiropi-1",
-    messages=[{"role": "user", "content": "Explain Golang concurrency"}],
+    messages=[{"role": "user", "content": "Explain Go concurrency"}],
     stream=True
 )
 
 for chunk in stream:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
-print()
 ```
 
 ### JavaScript/TypeScript
@@ -232,134 +311,65 @@ const data = await response.json();
 console.log(data.choices[0].message.content);
 ```
 
-### cURL (streaming)
-
-```bash
-curl -N -X POST http://localhost:50403/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key" \
-  -d '{
-    "model": "kiropi-1",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
 ## Deployment with Cloudflare Tunnel
 
-Cloudflare Tunnel lets you expose Kiropi to the internet **without a public IP or port forwarding**. This is the recommended way to let Kiro (or any remote MCP client) connect to your Kiropi instance.
-
-### Architecture
+Expose Kiropi to the internet so Kiro can reach it from anywhere:
 
 ```
-┌───────────────┐         ┌──────────────────┐         ┌──────────────────┐
-│  Kiro / Apps  │ ◄─HTTPS─► Cloudflare Edge  │ ◄─────► │  cloudflared     │
-│  (anywhere)   │         │  (global CDN)    │         │  + Kiropi        │
-└───────────────┘         └──────────────────┘         │  (your machine)  │
-                                                        └──────────────────┘
+┌────────┐         ┌──────────────────┐         ┌──────────────────┐
+│  Kiro  │ ◄─HTTPS─► Cloudflare Edge  │ ◄─────► │  cloudflared     │
+│(remote)│         │  (global CDN)    │         │  + Kiropi        │
+└────────┘         └──────────────────┘         │  (your laptop)   │
+                                                 └──────────────────┘
 ```
 
-### Option 1: Quick Tunnel (no account needed)
-
-Perfect for testing. Gets a random `*.trycloudflare.com` URL:
+### Quick Tunnel (no account needed)
 
 ```bash
 # Terminal 1: Run Kiropi
-export KIROPI_MCP_COMMAND=your-mcp-server
-export KIROPI_API_KEY=mysecretkey
 ./kiropi
 
-# Terminal 2: Expose via Cloudflare
-cloudflared tunnel --url http://localhost:50403
+# Terminal 2: Expose MCP port via Cloudflare
+cloudflared tunnel --url http://localhost:50404
+# → https://random-words.trycloudflare.com
 ```
 
-Output:
-```
-Your quick Tunnel has been created! Visit it at:
-https://random-words-here.trycloudflare.com
-```
-
-Now any app can call:
-```bash
-curl -X POST https://random-words-here.trycloudflare.com/v1/chat/completions \
-  -H "Authorization: Bearer mysecretkey" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hello from the internet!"}]}'
+Then configure Kiro MCP:
+```json
+{
+  "mcpServers": {
+    "kiropi": {
+      "url": "https://random-words.trycloudflare.com/sse"
+    }
+  }
+}
 ```
 
-### Option 2: Named Tunnel (persistent URL)
-
-For production — requires a free Cloudflare account and a domain:
+### Named Tunnel (persistent)
 
 ```bash
-# 1. Login to Cloudflare
 cloudflared tunnel login
-
-# 2. Create a named tunnel
 cloudflared tunnel create kiropi
-
-# 3. Route DNS (use your domain)
 cloudflared tunnel route dns kiropi kiropi.yourdomain.com
 
-# 4. Create config ~/.cloudflared/config.yml
 cat > ~/.cloudflared/config.yml << EOF
 tunnel: <TUNNEL_ID>
-credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
   - hostname: kiropi.yourdomain.com
-    service: http://localhost:50403
+    service: http://localhost:50404
   - service: http_status:404
 EOF
 
-# 5. Run the tunnel
 cloudflared tunnel run kiropi
-```
-
-Now Kiropi is permanently available at `https://kiropi.yourdomain.com`.
-
-### Option 3: Use the setup script
-
-```bash
-./scripts/setup-tunnel.sh
-```
-
-Interactive script that handles installation and configuration.
-
-### Run as System Services
-
-```bash
-# Kiropi as systemd service
-sudo tee /etc/systemd/system/kiropi.service << EOF
-[Unit]
-Description=Kiropi MCP Bridge
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/kiropi
-EnvironmentFile=/etc/kiropi/.env
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Cloudflared as systemd service
-sudo cloudflared service install
-
-# Enable and start
-sudo systemctl enable --now kiropi
-sudo systemctl enable --now cloudflared
 ```
 
 ### Security Notes
 
-- **Always set `KIROPI_API_KEY`** when exposing to the internet
-- Cloudflare provides DDoS protection and TLS termination automatically
-- Consider using [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) for additional auth layer
-- The `X-Accel-Buffering: no` header is set for SSE compatibility through Cloudflare
+- **Always set `KIROPI_API_KEY`** for the REST API when exposed to the internet
+- MCP port (50404) should only be exposed to Kiro (via tunnel)
+- Cloudflare provides DDoS protection and TLS automatically
 
 ## License
 

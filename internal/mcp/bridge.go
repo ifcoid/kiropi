@@ -4,257 +4,155 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
-	"sync"
+	"log"
 
 	"github.com/ifcoid/kiropi/internal/config"
 	"github.com/ifcoid/kiropi/pkg/models"
-	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
-// Bridge connects REST API requests to MCP server (Kiro)
-type Bridge struct {
-	cfg    *config.Config
-	client *mcpclient.Client
-	mu     sync.RWMutex
-	ready  bool
+// Server wraps the MCP server that Kiro connects to
+type Server struct {
+	cfg       *config.Config
+	mcpServer *server.MCPServer
+	sseServer *server.SSEServer
+	queue     *models.PromptQueue
 }
 
-// NewBridge creates a new MCP Bridge
-func NewBridge(cfg *config.Config) *Bridge {
-	return &Bridge{
-		cfg: cfg,
+// NewServer creates a new MCP Server instance
+func NewServer(cfg *config.Config, queue *models.PromptQueue) *Server {
+	return &Server{
+		cfg:   cfg,
+		queue: queue,
 	}
 }
 
-// Connect establishes connection to the MCP server
-func (b *Bridge) Connect(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.cfg.MCPServerCommand == "" {
-		return fmt.Errorf("MCP server command not configured (set KIROPI_MCP_COMMAND)")
-	}
-
-	// Create stdio client to connect to MCP server
-	client, err := mcpclient.NewStdioMCPClient(
-		b.cfg.MCPServerCommand,
-		nil, // env
-		b.cfg.MCPServerArgs...,
+// Setup initializes the MCP server with tools
+func (s *Server) Setup() {
+	// Create MCP server
+	s.mcpServer = server.NewMCPServer(
+		"kiropi",
+		"1.0.0",
+		server.WithToolCapabilities(false),
+		server.WithInstructions("Kiropi MCP Server - Bridge between REST API and Kiro AI. Use get_pending_prompt to fetch prompts from the queue, then submit_response to send back your answer."),
 	)
-	if err != nil {
-		return fmt.Errorf("failed to create MCP client: %w", err)
-	}
 
-	b.client = client
+	// Register tools
+	s.registerTools()
 
-	// Initialize the MCP connection
-	initReq := mcp.InitializeRequest{}
-	initReq.Params.ClientInfo = mcp.Implementation{
-		Name:    "kiropi-bridge",
-		Version: "1.0.0",
-	}
-	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-	initReq.Params.Capabilities = mcp.ClientCapabilities{}
-
-	_, err = b.client.Initialize(ctx, initReq)
-	if err != nil {
-		return fmt.Errorf("failed to initialize MCP session: %w", err)
-	}
-
-	b.ready = true
-	return nil
+	// Create SSE server for remote connections (Kiro via cloudflared)
+	s.sseServer = server.NewSSEServer(s.mcpServer,
+		server.WithBaseURL(fmt.Sprintf("http://localhost:%s", s.cfg.MCPPort)),
+	)
 }
 
-// IsReady returns whether the bridge is connected and ready
-func (b *Bridge) IsReady() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.ready
+// registerTools registers all MCP tools that Kiro can call
+func (s *Server) registerTools() {
+	// Tool: get_pending_prompt
+	// Kiro calls this to pick up the next prompt from the queue
+	getPendingTool := mcp.NewTool("get_pending_prompt",
+		mcp.WithDescription("Get the next pending prompt from the queue. Returns the prompt messages that need a response. Returns empty if no prompts are waiting."),
+	)
+
+	s.mcpServer.AddTool(getPendingTool, s.handleGetPendingPrompt)
+
+	// Tool: submit_response
+	// Kiro calls this to submit its response for a prompt
+	submitResponseTool := mcp.NewTool("submit_response",
+		mcp.WithDescription("Submit a response for a pending prompt. The prompt_id must match a prompt retrieved via get_pending_prompt."),
+		mcp.WithString("prompt_id",
+			mcp.Required(),
+			mcp.Description("The ID of the prompt to respond to"),
+		),
+		mcp.WithString("response",
+			mcp.Required(),
+			mcp.Description("The AI response text to send back to the caller"),
+		),
+	)
+
+	s.mcpServer.AddTool(submitResponseTool, s.handleSubmitResponse)
+
+	// Tool: queue_status
+	// Kiro can check how many prompts are waiting
+	queueStatusTool := mcp.NewTool("queue_status",
+		mcp.WithDescription("Check the current status of the prompt queue. Returns pending count and total count."),
+	)
+
+	s.mcpServer.AddTool(queueStatusTool, s.handleQueueStatus)
 }
 
-// ListTools returns available tools from the MCP server
-func (b *Bridge) ListTools(ctx context.Context) ([]models.Tool, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	if !b.ready {
-		return nil, fmt.Errorf("MCP bridge not connected")
+// handleGetPendingPrompt handles the get_pending_prompt tool call from Kiro
+func (s *Server) handleGetPendingPrompt(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	prompt := s.queue.Dequeue()
+	if prompt == nil {
+		return mcp.NewToolResultText(`{"status": "empty", "message": "No pending prompts in queue"}`), nil
 	}
 
-	toolsReq := mcp.ListToolsRequest{}
-	result, err := b.client.ListTools(ctx, toolsReq)
+	// Build a JSON response with prompt details
+	type promptResponse struct {
+		Status   string               `json:"status"`
+		PromptID string               `json:"prompt_id"`
+		Model    string               `json:"model,omitempty"`
+		Messages []models.ChatMessage `json:"messages"`
+	}
+
+	resp := promptResponse{
+		Status:   "pending",
+		PromptID: prompt.ID,
+		Model:    prompt.Model,
+		Messages: prompt.Messages,
+	}
+
+	data, err := json.Marshal(resp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tools: %w", err)
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal prompt: %v", err)), nil
 	}
 
-	tools := make([]models.Tool, 0, len(result.Tools))
-	for _, t := range result.Tools {
-		tools = append(tools, models.Tool{
-			Type: "function",
-			Function: models.ToolFunction{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.InputSchema,
-			},
-		})
-	}
-
-	return tools, nil
+	log.Printf("[MCP] Prompt %s picked up by Kiro", prompt.ID)
+	return mcp.NewToolResultText(string(data)), nil
 }
 
-// ProcessChat processes a chat completion request through the MCP server
-// It converts the OpenAI-format messages into MCP tool calls
-func (b *Bridge) ProcessChat(ctx context.Context, req *models.ChatCompletionRequest) (string, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	if !b.ready {
-		return "", fmt.Errorf("MCP bridge not connected")
+// handleSubmitResponse handles the submit_response tool call from Kiro
+func (s *Server) handleSubmitResponse(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	promptID, ok := request.Params.Arguments["prompt_id"].(string)
+	if !ok || promptID == "" {
+		return mcp.NewToolResultError("prompt_id is required"), nil
 	}
 
-	// Extract the last user message as the prompt
-	prompt := extractLastUserMessage(req.Messages)
-	if prompt == "" {
-		return "", fmt.Errorf("no user message found in request")
+	response, ok := request.Params.Arguments["response"].(string)
+	if !ok || response == "" {
+		return mcp.NewToolResultError("response is required"), nil
 	}
 
-	// Build conversation context from message history
-	conversationContext := buildConversationContext(req.Messages)
-
-	// Call the MCP server's tool - try "ask" first, then "chat"
-	response, err := b.callMCPTool(ctx, "ask", map[string]interface{}{
-		"prompt":  prompt,
-		"context": conversationContext,
-	})
-	if err != nil {
-		// Fallback: try calling with just the prompt as a generic tool
-		response, err = b.callMCPTool(ctx, "chat", map[string]interface{}{
-			"messages": req.Messages,
-		})
-		if err != nil {
-			return "", fmt.Errorf("failed to process through MCP: %w", err)
-		}
+	success := s.queue.SubmitResponse(promptID, response)
+	if !success {
+		return mcp.NewToolResultError(fmt.Sprintf("prompt %s not found or already completed", promptID)), nil
 	}
 
-	return response, nil
+	log.Printf("[MCP] Response submitted for prompt %s (%d chars)", promptID, len(response))
+	return mcp.NewToolResultText(fmt.Sprintf(`{"status": "submitted", "prompt_id": "%s"}`, promptID)), nil
 }
 
-// ProcessChatStream processes a chat request and sends chunks to the provided channel.
-// Each string sent to the channel represents a text chunk to be streamed.
-// The channel is closed when processing is complete.
-func (b *Bridge) ProcessChatStream(ctx context.Context, req *models.ChatCompletionRequest, chunks chan<- string) error {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	if !b.ready {
-		return fmt.Errorf("MCP bridge not connected")
-	}
-
-	prompt := extractLastUserMessage(req.Messages)
-	if prompt == "" {
-		return fmt.Errorf("no user message found in request")
-	}
-
-	conversationContext := buildConversationContext(req.Messages)
-
-	// Get the full response from MCP
-	response, err := b.callMCPTool(ctx, "ask", map[string]interface{}{
-		"prompt":  prompt,
-		"context": conversationContext,
-		"stream":  true,
-	})
-	if err != nil {
-		response, err = b.callMCPTool(ctx, "chat", map[string]interface{}{
-			"messages": req.Messages,
-			"stream":   true,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to process through MCP: %w", err)
-		}
-	}
-
-	// Simulate streaming by splitting response into chunks
-	// MCP doesn't natively support streaming from tool calls,
-	// so we chunk the response to provide SSE experience
-	chunkSize := 20 // characters per chunk (tunable)
-	runes := []rune(response)
-
-	for i := 0; i < len(runes); i += chunkSize {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			end := i + chunkSize
-			if end > len(runes) {
-				end = len(runes)
-			}
-			chunks <- string(runes[i:end])
-		}
-	}
-
-	return nil
+// handleQueueStatus handles the queue_status tool call
+func (s *Server) handleQueueStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	status := fmt.Sprintf(`{"pending": %d, "total": %d}`, s.queue.PendingCount(), s.queue.TotalCount())
+	return mcp.NewToolResultText(status), nil
 }
 
-// callMCPTool calls a specific tool on the MCP server
-func (b *Bridge) callMCPTool(ctx context.Context, toolName string, args map[string]interface{}) (string, error) {
-	callReq := mcp.CallToolRequest{}
-	callReq.Params.Name = toolName
-	callReq.Params.Arguments = args
-
-	result, err := b.client.CallTool(ctx, callReq)
-	if err != nil {
-		return "", err
-	}
-
-	// Extract text content from the result
-	var responseText strings.Builder
-	for _, content := range result.Content {
-		if textContent, ok := mcp.AsTextContent(content); ok {
-			responseText.WriteString(textContent.Text)
-		} else {
-			// Try to marshal as JSON for other content types
-			data, _ := json.Marshal(content)
-			responseText.WriteString(string(data))
-		}
-	}
-
-	if result.IsError {
-		return "", fmt.Errorf("MCP tool error: %s", responseText.String())
-	}
-
-	return responseText.String(), nil
+// Start starts the MCP SSE server
+func (s *Server) Start() error {
+	addr := ":" + s.cfg.MCPPort
+	log.Printf("[MCP] SSE Server starting on %s", addr)
+	log.Printf("[MCP] SSE endpoint: /sse")
+	log.Printf("[MCP] Message endpoint: /message")
+	return s.sseServer.Start(addr)
 }
 
-// Close closes the MCP connection
-func (b *Bridge) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.client != nil {
-		err := b.client.Close()
-		b.ready = false
-		return err
+// Shutdown gracefully stops the MCP server
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.sseServer != nil {
+		return s.sseServer.Shutdown(ctx)
 	}
 	return nil
-}
-
-// extractLastUserMessage gets the last user message from the conversation
-func extractLastUserMessage(messages []models.ChatMessage) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return messages[i].Content
-		}
-	}
-	return ""
-}
-
-// buildConversationContext builds a string context from message history
-func buildConversationContext(messages []models.ChatMessage) string {
-	var ctx strings.Builder
-	for _, msg := range messages {
-		ctx.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
-	}
-	return ctx.String()
 }

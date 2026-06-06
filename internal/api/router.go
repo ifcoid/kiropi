@@ -3,11 +3,11 @@ package api
 import (
 	"github.com/gin-gonic/gin"
 	"github.com/ifcoid/kiropi/internal/config"
-	mcpbridge "github.com/ifcoid/kiropi/internal/mcp"
+	"github.com/ifcoid/kiropi/pkg/models"
 )
 
 // SetupRouter configures and returns the Gin router
-func SetupRouter(bridge *mcpbridge.Bridge, cfg *config.Config) *gin.Engine {
+func SetupRouter(queue *models.PromptQueue, cfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 
@@ -18,7 +18,7 @@ func SetupRouter(bridge *mcpbridge.Bridge, cfg *config.Config) *gin.Engine {
 	router.Use(AuthMiddleware(cfg))
 
 	// Handler
-	handler := NewHandler(bridge, cfg)
+	handler := NewHandler(queue, cfg)
 
 	// Health check (no auth required - handled in middleware)
 	router.GET("/health", handler.HealthCheck)
@@ -28,7 +28,6 @@ func SetupRouter(bridge *mcpbridge.Bridge, cfg *config.Config) *gin.Engine {
 	{
 		v1.POST("/chat/completions", handler.ChatCompletion)
 		v1.GET("/models", handler.ListModels)
-		v1.GET("/tools", handler.ListTools)
 	}
 
 	// Convenience alias

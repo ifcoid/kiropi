@@ -3,24 +3,18 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds all application configuration
 type Config struct {
-	// REST API server port
+	// REST API server port (for NSA/apps to call)
 	ServerPort string
 
-	// MCP Server configuration
-	MCPServerCommand string   // Command to start MCP server (e.g., "npx", "node", "python")
-	MCPServerArgs    []string // Arguments for the MCP server command
+	// MCP Server port (for Kiro to connect via SSE)
+	MCPPort string
 
-	// MCP Transport type: "stdio" or "sse"
-	MCPTransport string
-
-	// MCP SSE URL (if using SSE transport)
-	MCPSSEURL string
-
-	// API Key for authentication (optional)
+	// API Key for REST endpoint authentication (optional)
 	APIKey string
 
 	// Default model name to report
@@ -28,21 +22,23 @@ type Config struct {
 
 	// Max concurrent requests
 	MaxConcurrent int
+
+	// Prompt timeout - how long to wait for Kiro to respond
+	PromptTimeout time.Duration
 }
 
 // Load reads configuration from environment variables with sensible defaults
 func Load() *Config {
 	maxConcurrent, _ := strconv.Atoi(getEnv("KIROPI_MAX_CONCURRENT", "10"))
+	timeoutSec, _ := strconv.Atoi(getEnv("KIROPI_PROMPT_TIMEOUT", "120"))
 
 	return &Config{
-		ServerPort:       getEnv("KIROPI_PORT", "50403"),
-		MCPServerCommand: getEnv("KIROPI_MCP_COMMAND", ""),
-		MCPServerArgs:    parseArgs(getEnv("KIROPI_MCP_ARGS", "")),
-		MCPTransport:     getEnv("KIROPI_MCP_TRANSPORT", "stdio"),
-		MCPSSEURL:        getEnv("KIROPI_MCP_SSE_URL", ""),
-		APIKey:           getEnv("KIROPI_API_KEY", ""),
-		DefaultModel:     getEnv("KIROPI_MODEL", "kiropi-1"),
-		MaxConcurrent:    maxConcurrent,
+		ServerPort:    getEnv("KIROPI_PORT", "50403"),
+		MCPPort:       getEnv("KIROPI_MCP_PORT", "50404"),
+		APIKey:        getEnv("KIROPI_API_KEY", ""),
+		DefaultModel:  getEnv("KIROPI_MODEL", "kiropi-1"),
+		MaxConcurrent: maxConcurrent,
+		PromptTimeout: time.Duration(timeoutSec) * time.Second,
 	}
 }
 
@@ -51,31 +47,4 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func parseArgs(args string) []string {
-	if args == "" {
-		return []string{}
-	}
-	// Simple space-separated parsing
-	result := []string{}
-	current := ""
-	inQuote := false
-	for _, ch := range args {
-		switch {
-		case ch == '"':
-			inQuote = !inQuote
-		case ch == ' ' && !inQuote:
-			if current != "" {
-				result = append(result, current)
-				current = ""
-			}
-		default:
-			current += string(ch)
-		}
-	}
-	if current != "" {
-		result = append(result, current)
-	}
-	return result
 }

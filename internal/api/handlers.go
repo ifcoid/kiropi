@@ -9,21 +9,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ifcoid/kiropi/internal/config"
-	mcpbridge "github.com/ifcoid/kiropi/internal/mcp"
 	"github.com/ifcoid/kiropi/pkg/models"
 )
 
 // Handler holds the API handler dependencies
 type Handler struct {
-	bridge *mcpbridge.Bridge
-	cfg    *config.Config
+	queue *models.PromptQueue
+	cfg   *config.Config
 }
 
 // NewHandler creates a new API handler
-func NewHandler(bridge *mcpbridge.Bridge, cfg *config.Config) *Handler {
+func NewHandler(queue *models.PromptQueue, cfg *config.Config) *Handler {
 	return &Handler{
-		bridge: bridge,
-		cfg:    cfg,
+		queue: queue,
+		cfg:   cfg,
 	}
 }
 
@@ -53,18 +52,6 @@ func (h *Handler) ChatCompletion(c *gin.Context) {
 		return
 	}
 
-	// Check if bridge is ready
-	if !h.bridge.IsReady() {
-		c.JSON(http.StatusServiceUnavailable, models.ErrorResponse{
-			Error: models.ErrorDetail{
-				Message: "MCP bridge is not connected. Service unavailable.",
-				Type:    "server_error",
-				Code:    "bridge_not_ready",
-			},
-		})
-		return
-	}
-
 	// Route to streaming or non-streaming handler
 	if req.Stream {
 		h.chatCompletionStream(c, &req)
@@ -76,25 +63,36 @@ func (h *Handler) ChatCompletion(c *gin.Context) {
 
 // chatCompletionNonStream handles non-streaming chat completions
 func (h *Handler) chatCompletionNonStream(c *gin.Context, req *models.ChatCompletionRequest) {
-	// Process through MCP bridge
-	response, err := h.bridge.ProcessChat(c.Request.Context(), req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
-			Error: models.ErrorDetail{
-				Message: "Failed to process request: " + err.Error(),
-				Type:    "server_error",
-				Code:    "mcp_error",
-			},
-		})
-		return
-	}
-
-	// Build OpenAI-compatible response
-	completionID := "chatcmpl-" + uuid.New().String()[:8]
+	// Generate prompt ID and enqueue
+	promptID := uuid.New().String()
 	modelName := req.Model
 	if modelName == "" {
 		modelName = h.cfg.DefaultModel
 	}
+
+	prompt := h.queue.Enqueue(promptID, req.Messages, modelName)
+	defer h.queue.Remove(promptID)
+
+	// Wait for Kiro to respond (with timeout)
+	select {
+	case <-prompt.Done:
+		// Kiro has responded
+	case <-time.After(h.queue.Timeout()):
+		c.JSON(http.StatusGatewayTimeout, models.ErrorResponse{
+			Error: models.ErrorDetail{
+				Message: "Timeout waiting for AI response. Kiro may not be connected.",
+				Type:    "server_error",
+				Code:    "timeout",
+			},
+		})
+		return
+	case <-c.Request.Context().Done():
+		// Client disconnected
+		return
+	}
+
+	// Build OpenAI-compatible response
+	completionID := "chatcmpl-" + promptID[:8]
 
 	c.JSON(http.StatusOK, models.ChatCompletionResponse{
 		ID:      completionID,
@@ -106,36 +104,38 @@ func (h *Handler) chatCompletionNonStream(c *gin.Context, req *models.ChatComple
 				Index: 0,
 				Message: models.ChatMessage{
 					Role:    "assistant",
-					Content: response,
+					Content: prompt.Response,
 				},
 				FinishReason: "stop",
 			},
 		},
 		Usage: models.Usage{
 			PromptTokens:     estimateTokens(req.Messages),
-			CompletionTokens: estimateTokens([]models.ChatMessage{{Content: response}}),
-			TotalTokens:      estimateTokens(req.Messages) + estimateTokens([]models.ChatMessage{{Content: response}}),
+			CompletionTokens: estimateTokens([]models.ChatMessage{{Content: prompt.Response}}),
+			TotalTokens:      estimateTokens(req.Messages) + estimateTokens([]models.ChatMessage{{Content: prompt.Response}}),
 		},
 	})
 }
 
 // chatCompletionStream handles SSE streaming chat completions
 func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletionRequest) {
-	completionID := "chatcmpl-" + uuid.New().String()[:8]
+	// Generate prompt ID and enqueue
+	promptID := uuid.New().String()
 	modelName := req.Model
 	if modelName == "" {
 		modelName = h.cfg.DefaultModel
 	}
-	created := time.Now().Unix()
+
+	prompt := h.queue.Enqueue(promptID, req.Messages, modelName)
+	defer h.queue.Remove(promptID)
 
 	// Set SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("Transfer-Encoding", "chunked")
-	c.Header("X-Accel-Buffering", "no") // Disable nginx buffering
+	c.Header("X-Accel-Buffering", "no")
 
-	// Get the http.Flusher
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
@@ -147,6 +147,9 @@ func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletio
 		})
 		return
 	}
+
+	completionID := "chatcmpl-" + promptID[:8]
+	created := time.Now().Unix()
 
 	// Send initial chunk with role
 	initialChunk := models.ChatCompletionChunk{
@@ -164,45 +167,14 @@ func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletio
 			},
 		},
 	}
-	h.writeSSEChunk(c, flusher, &initialChunk)
+	writeSSEChunk(c, flusher, &initialChunk)
 
-	// Process through MCP bridge with streaming
-	chunks := make(chan string, 100)
-	errChan := make(chan error, 1)
-
-	go func() {
-		defer close(chunks)
-		errChan <- h.bridge.ProcessChatStream(c.Request.Context(), req, chunks)
-	}()
-
-	// Stream chunks to client
-	for chunk := range chunks {
-		select {
-		case <-c.Request.Context().Done():
-			return
-		default:
-			chunkData := models.ChatCompletionChunk{
-				ID:      completionID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   modelName,
-				Choices: []models.ChunkChoice{
-					{
-						Index: 0,
-						Delta: models.ChunkDelta{
-							Content: chunk,
-						},
-						FinishReason: nil,
-					},
-				},
-			}
-			h.writeSSEChunk(c, flusher, &chunkData)
-		}
-	}
-
-	// Check for errors
-	if err := <-errChan; err != nil {
-		// Send error as a chunk (best effort, client may have disconnected)
+	// Wait for Kiro to respond (with timeout)
+	select {
+	case <-prompt.Done:
+		// Kiro has responded — stream in chunks
+	case <-time.After(h.queue.Timeout()):
+		// Timeout — send error chunk
 		errChunk := models.ChatCompletionChunk{
 			ID:      completionID,
 			Object:  "chat.completion.chunk",
@@ -212,13 +184,53 @@ func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletio
 				{
 					Index: 0,
 					Delta: models.ChunkDelta{
-						Content: fmt.Sprintf("\n\n[Error: %s]", err.Error()),
+						Content: "[Error: Timeout waiting for AI response. Kiro may not be connected.]",
 					},
 					FinishReason: nil,
 				},
 			},
 		}
-		h.writeSSEChunk(c, flusher, &errChunk)
+		writeSSEChunk(c, flusher, &errChunk)
+		stopReason := "stop"
+		finalChunk := models.ChatCompletionChunk{
+			ID: completionID, Object: "chat.completion.chunk", Created: created, Model: modelName,
+			Choices: []models.ChunkChoice{{Index: 0, Delta: models.ChunkDelta{}, FinishReason: &stopReason}},
+		}
+		writeSSEChunk(c, flusher, &finalChunk)
+		fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	case <-c.Request.Context().Done():
+		return
+	}
+
+	// Stream the response in chunks
+	response := prompt.Response
+	chunkSize := 20 // characters per chunk
+	runes := []rune(response)
+
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		contentChunk := models.ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   modelName,
+			Choices: []models.ChunkChoice{
+				{
+					Index: 0,
+					Delta: models.ChunkDelta{
+						Content: string(runes[i:end]),
+					},
+					FinishReason: nil,
+				},
+			},
+		}
+		writeSSEChunk(c, flusher, &contentChunk)
 	}
 
 	// Send final chunk with finish_reason
@@ -236,20 +248,10 @@ func (h *Handler) chatCompletionStream(c *gin.Context, req *models.ChatCompletio
 			},
 		},
 	}
-	h.writeSSEChunk(c, flusher, &finalChunk)
+	writeSSEChunk(c, flusher, &finalChunk)
 
 	// Send [DONE] marker
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
-	flusher.Flush()
-}
-
-// writeSSEChunk writes a single SSE event to the response
-func (h *Handler) writeSSEChunk(c *gin.Context, flusher http.Flusher, chunk *models.ChatCompletionChunk) {
-	data, err := json.Marshal(chunk)
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
 	flusher.Flush()
 }
 
@@ -268,51 +270,24 @@ func (h *Handler) ListModels(c *gin.Context) {
 	})
 }
 
-// ListTools handles GET /v1/tools - returns available MCP tools
-func (h *Handler) ListTools(c *gin.Context) {
-	if !h.bridge.IsReady() {
-		c.JSON(http.StatusServiceUnavailable, models.ErrorResponse{
-			Error: models.ErrorDetail{
-				Message: "MCP bridge is not connected",
-				Type:    "server_error",
-				Code:    "bridge_not_ready",
-			},
-		})
-		return
-	}
-
-	tools, err := h.bridge.ListTools(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
-			Error: models.ErrorDetail{
-				Message: "Failed to list tools: " + err.Error(),
-				Type:    "server_error",
-				Code:    "mcp_error",
-			},
-		})
-		return
-	}
-
+// HealthCheck handles GET /health
+func (h *Handler) HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"tools": tools,
+		"status":        "ok",
+		"queue_pending": h.queue.PendingCount(),
+		"queue_total":   h.queue.TotalCount(),
+		"timestamp":     time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// HealthCheck handles GET /health
-func (h *Handler) HealthCheck(c *gin.Context) {
-	status := "ok"
-	mcpStatus := "connected"
-
-	if !h.bridge.IsReady() {
-		status = "degraded"
-		mcpStatus = "disconnected"
+// writeSSEChunk writes a single SSE event to the response
+func writeSSEChunk(c *gin.Context, flusher http.Flusher, chunk *models.ChatCompletionChunk) {
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":     status,
-		"mcp_bridge": mcpStatus,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-	})
+	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+	flusher.Flush()
 }
 
 // estimateTokens provides a rough token count estimation (~4 chars per token)
