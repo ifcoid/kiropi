@@ -16,12 +16,14 @@ Kiropi is a Golang server that acts as a bridge between any application and an M
 ## Features
 
 - OpenAI-compatible REST API (`/v1/chat/completions`)
+- **SSE Streaming** support (`"stream": true`)
 - MCP client that connects to any MCP server via stdio or SSE
 - Bearer token authentication (optional)
 - CORS support
 - Graceful shutdown
 - Health check endpoint
-- Docker support
+- Cloudflare Tunnel ready (expose to internet without public IP)
+- Single binary, runs anywhere (Linux, macOS, Windows)
 
 ## Quick Start
 
@@ -46,11 +48,20 @@ go build -o kiropi ./cmd/server
 ./kiropi
 ```
 
-### Run with Docker
+### Cross-compile
 
 ```bash
-docker build -t kiropi .
-docker run -p 8080:8080 --env-file .env kiropi
+# Linux AMD64
+GOOS=linux GOARCH=amd64 go build -o kiropi-linux-amd64 ./cmd/server
+
+# Linux ARM64 (Raspberry Pi, etc)
+GOOS=linux GOARCH=arm64 go build -o kiropi-linux-arm64 ./cmd/server
+
+# macOS
+GOOS=darwin GOARCH=arm64 go build -o kiropi-darwin-arm64 ./cmd/server
+
+# Windows
+GOOS=windows GOARCH=amd64 go build -o kiropi.exe ./cmd/server
 ```
 
 ## Configuration
@@ -180,6 +191,28 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Python (streaming)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="your-api-key"
+)
+
+stream = client.chat.completions.create(
+    model="kiropi-1",
+    messages=[{"role": "user", "content": "Explain Golang concurrency"}],
+    stream=True
+)
+
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
+```
+
 ### JavaScript/TypeScript
 
 ```typescript
@@ -198,6 +231,135 @@ const response = await fetch('http://localhost:8080/v1/chat/completions', {
 const data = await response.json();
 console.log(data.choices[0].message.content);
 ```
+
+### cURL (streaming)
+
+```bash
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "kiropi-1",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+## Deployment with Cloudflare Tunnel
+
+Cloudflare Tunnel lets you expose Kiropi to the internet **without a public IP or port forwarding**. This is the recommended way to let Kiro (or any remote MCP client) connect to your Kiropi instance.
+
+### Architecture
+
+```
+┌───────────────┐         ┌──────────────────┐         ┌──────────────────┐
+│  Kiro / Apps  │ ◄─HTTPS─► Cloudflare Edge  │ ◄─────► │  cloudflared     │
+│  (anywhere)   │         │  (global CDN)    │         │  + Kiropi        │
+└───────────────┘         └──────────────────┘         │  (your machine)  │
+                                                        └──────────────────┘
+```
+
+### Option 1: Quick Tunnel (no account needed)
+
+Perfect for testing. Gets a random `*.trycloudflare.com` URL:
+
+```bash
+# Terminal 1: Run Kiropi
+export KIROPI_MCP_COMMAND=your-mcp-server
+export KIROPI_API_KEY=mysecretkey
+./kiropi
+
+# Terminal 2: Expose via Cloudflare
+cloudflared tunnel --url http://localhost:8080
+```
+
+Output:
+```
+Your quick Tunnel has been created! Visit it at:
+https://random-words-here.trycloudflare.com
+```
+
+Now any app can call:
+```bash
+curl -X POST https://random-words-here.trycloudflare.com/v1/chat/completions \
+  -H "Authorization: Bearer mysecretkey" \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello from the internet!"}]}'
+```
+
+### Option 2: Named Tunnel (persistent URL)
+
+For production — requires a free Cloudflare account and a domain:
+
+```bash
+# 1. Login to Cloudflare
+cloudflared tunnel login
+
+# 2. Create a named tunnel
+cloudflared tunnel create kiropi
+
+# 3. Route DNS (use your domain)
+cloudflared tunnel route dns kiropi kiropi.yourdomain.com
+
+# 4. Create config ~/.cloudflared/config.yml
+cat > ~/.cloudflared/config.yml << EOF
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: kiropi.yourdomain.com
+    service: http://localhost:8080
+  - service: http_status:404
+EOF
+
+# 5. Run the tunnel
+cloudflared tunnel run kiropi
+```
+
+Now Kiropi is permanently available at `https://kiropi.yourdomain.com`.
+
+### Option 3: Use the setup script
+
+```bash
+./scripts/setup-tunnel.sh
+```
+
+Interactive script that handles installation and configuration.
+
+### Run as System Services
+
+```bash
+# Kiropi as systemd service
+sudo tee /etc/systemd/system/kiropi.service << EOF
+[Unit]
+Description=Kiropi MCP Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kiropi
+EnvironmentFile=/etc/kiropi/.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Cloudflared as systemd service
+sudo cloudflared service install
+
+# Enable and start
+sudo systemctl enable --now kiropi
+sudo systemctl enable --now cloudflared
+```
+
+### Security Notes
+
+- **Always set `KIROPI_API_KEY`** when exposing to the internet
+- Cloudflare provides DDoS protection and TLS termination automatically
+- Consider using [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) for additional auth layer
+- The `X-Accel-Buffering: no` header is set for SSE compatibility through Cloudflare
 
 ## License
 
